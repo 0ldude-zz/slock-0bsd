@@ -13,16 +13,25 @@
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
+#include <time.h>
 #include <sys/types.h>
 #include <X11/extensions/Xrandr.h>
 #include <X11/keysym.h>
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
+#include <Imlib2.h>
+
+#if HAVE_BSD_AUTH
+#include <login_cap.h>
+#include <bsd_auth.h>
+#endif
 
 #include "arg.h"
 #include "util.h"
 
 char *argv0;
+
+static time_t locktime;
 
 enum {
 	INIT,
@@ -35,6 +44,7 @@ struct lock {
 	int screen;
 	Window root, win;
 	Pixmap pmap;
+	Pixmap bgmap;
 	unsigned long colors[NUMCOLS];
 };
 
@@ -45,6 +55,8 @@ struct xrandr {
 };
 
 #include "config.h"
+
+Imlib_Image image;
 
 static void
 die(const char *errstr, ...)
@@ -83,6 +95,7 @@ dontkillme(void)
 }
 #endif
 
+#ifndef HAVE_BSD_AUTH
 static const char *
 gethash(void)
 {
@@ -123,13 +136,21 @@ gethash(void)
 
 	return hash;
 }
+#endif /* HAVE_BSD_AUTH */
 
 static void
+#ifdef HAVE_BSD_AUTH
+readpw(Display *dpy, struct xrandr *rr, struct lock **locks, int nscreens)
+#else
 readpw(Display *dpy, struct xrandr *rr, struct lock **locks, int nscreens,
        const char *hash)
+#endif
 {
 	XRRScreenChangeNotifyEvent *rre;
-	char buf[32], passwd[256], *inputhash;
+	char buf[32], passwd[256];
+#ifndef HAVE_BSD_AUTH
+	char *inputhash;
+#endif
 	int num, screen, running, failure, oldc;
 	unsigned int len, color;
 	KeySym ksym;
@@ -141,6 +162,7 @@ readpw(Display *dpy, struct xrandr *rr, struct lock **locks, int nscreens,
 	oldc = INIT;
 
 	while (running && !XNextEvent(dpy, &ev)) {
+		running = !((time(NULL) - locktime < timetocancel) && (ev.type == MotionNotify));
 		if (ev.type == KeyPress) {
 			explicit_bzero(&buf, sizeof(buf));
 			num = XLookupString(&ev.xkey, buf, sizeof(buf), &ksym, 0);
@@ -160,10 +182,14 @@ readpw(Display *dpy, struct xrandr *rr, struct lock **locks, int nscreens,
 			case XK_Return:
 				passwd[len] = '\0';
 				errno = 0;
+#ifdef HAVE_BSD_AUTH
+				running = !auth_userokay(getlogin(), NULL, "auth-slock", passwd);
+#else
 				if (!(inputhash = crypt(passwd, hash)))
 					fprintf(stderr, "slock: crypt: %s\n", strerror(errno));
 				else
 					running = !!strcmp(inputhash, hash);
+#endif
 				if (running) {
 					XBell(dpy, 100);
 					failure = 1;
@@ -190,9 +216,10 @@ readpw(Display *dpy, struct xrandr *rr, struct lock **locks, int nscreens,
 			color = len ? INPUT : ((failure || failonclear) ? FAILED : INIT);
 			if (running && oldc != color) {
 				for (screen = 0; screen < nscreens; screen++) {
-					XSetWindowBackground(dpy,
-					                     locks[screen]->win,
-					                     locks[screen]->colors[color]);
+                    if(locks[screen]->bgmap)
+                        XSetWindowBackgroundPixmap(dpy, locks[screen]->win, locks[screen]->bgmap);
+                    else
+                        XSetWindowBackground(dpy, locks[screen]->win, locks[screen]->colors[0]);
 					XClearWindow(dpy, locks[screen]->win);
 				}
 				oldc = color;
@@ -235,6 +262,17 @@ lockscreen(Display *dpy, struct xrandr *rr, int screen)
 	lock->screen = screen;
 	lock->root = RootWindow(dpy, lock->screen);
 
+    if(image) 
+    {
+        lock->bgmap = XCreatePixmap(dpy, lock->root, DisplayWidth(dpy, lock->screen), DisplayHeight(dpy, lock->screen), DefaultDepth(dpy, lock->screen));
+        imlib_context_set_image(image);
+        imlib_context_set_display(dpy);
+        imlib_context_set_visual(DefaultVisual(dpy, lock->screen));
+        imlib_context_set_colormap(DefaultColormap(dpy, lock->screen));
+        imlib_context_set_drawable(lock->bgmap);
+        imlib_render_image_on_drawable(0, 0);
+        imlib_free_image();
+    }
 	for (i = 0; i < NUMCOLS; i++) {
 		XAllocNamedColor(dpy, DefaultColormap(dpy, lock->screen),
 		                 colorname[i], &color, &dummy);
@@ -251,6 +289,8 @@ lockscreen(Display *dpy, struct xrandr *rr, int screen)
 	                          CopyFromParent,
 	                          DefaultVisual(dpy, lock->screen),
 	                          CWOverrideRedirect | CWBackPixel, &wa);
+    if(lock->bgmap)
+        XSetWindowBackgroundPixmap(dpy, lock->win, lock->bgmap);
 	lock->pmap = XCreateBitmapFromData(dpy, lock->win, curs, 8, 8);
 	invisible = XCreatePixmapCursor(dpy, lock->pmap, lock->pmap,
 	                                &color, &color, 0, 0);
@@ -276,6 +316,7 @@ lockscreen(Display *dpy, struct xrandr *rr, int screen)
 				XRRSelectInput(dpy, lock->win, RRScreenChangeNotifyMask);
 
 			XSelectInput(dpy, lock->root, SubstructureNotifyMask);
+			locktime = time(NULL);
 			return lock;
 		}
 
@@ -311,7 +352,9 @@ main(int argc, char **argv) {
 	struct group *grp;
 	uid_t duid;
 	gid_t dgid;
+#ifndef HAVE_BSD_AUTH
 	const char *hash;
+#endif
 	Display *dpy;
 	int s, nlocks, nscreens;
 
@@ -339,14 +382,23 @@ main(int argc, char **argv) {
 	dontkillme();
 #endif
 
+#ifndef HAVE_BSD_AUTH
 	hash = gethash();
 	errno = 0;
 	if (!crypt("", hash))
 		die("slock: crypt: %s\n", strerror(errno));
+#endif
 
 	if (!(dpy = XOpenDisplay(NULL)))
 		die("slock: cannot open display\n");
 
+/*
+ * don't drop groups for bsd-auth, slock runs as the user's normal
+ * uid, and requires gid auth from the setgid bit. (without bsd-auth
+ * slock needs to start with uid root or gid _shadow to read spwd.db,
+ * and is unable to use non-password methods)
+ */
+#ifndef HAVE_BSD_AUTH
 	/* drop privileges */
 	if (setgroups(0, NULL) < 0)
 		die("slock: setgroups: %s\n", strerror(errno));
@@ -354,7 +406,62 @@ main(int argc, char **argv) {
 		die("slock: setgid: %s\n", strerror(errno));
 	if (setuid(duid) < 0)
 		die("slock: setuid: %s\n", strerror(errno));
+#endif
 
+	/*Create screenshot Image*/
+	Screen *scr = ScreenOfDisplay(dpy, DefaultScreen(dpy));
+	image = imlib_create_image(scr->width,scr->height);
+	imlib_context_set_image(image);
+	imlib_context_set_display(dpy);
+	imlib_context_set_visual(DefaultVisual(dpy,0));
+	imlib_context_set_drawable(RootWindow(dpy,XScreenNumberOfScreen(scr)));	
+	imlib_copy_drawable_to_image(0,0,0,scr->width,scr->height,0,0,1);
+
+#ifdef BLUR
+
+	/*Blur function*/
+	imlib_image_blur(blurRadius);
+#endif // BLUR	
+
+#ifdef PIXELATION
+	/*Pixelation*/
+	int width = scr->width;
+	int height = scr->height;
+	
+	for(int y = 0; y < height; y += pixelSize)
+	{
+		for(int x = 0; x < width; x += pixelSize)
+		{
+			int red = 0;
+			int green = 0;
+			int blue = 0;
+
+			Imlib_Color pixel; 
+			Imlib_Color* pp;
+			pp = &pixel;
+			for(int j = 0; j < pixelSize && j < height; j++)
+			{
+				for(int i = 0; i < pixelSize && i < width; i++)
+				{
+					imlib_image_query_pixel(x+i,y+j,pp);
+					red += pixel.red;
+					green += pixel.green;
+					blue += pixel.blue;
+				}
+			}
+			red /= (pixelSize*pixelSize);
+			green /= (pixelSize*pixelSize);
+			blue /= (pixelSize*pixelSize);
+			imlib_context_set_color(red,green,blue,pixel.alpha);
+			imlib_image_fill_rectangle(x,y,pixelSize,pixelSize);
+			red = 0;
+			green = 0;
+			blue = 0;
+		}
+	}
+	
+	
+#endif
 	/* check for Xrandr support */
 	rr.active = XRRQueryExtension(dpy, &rr.evbase, &rr.errbase);
 
@@ -389,7 +496,11 @@ main(int argc, char **argv) {
 	}
 
 	/* everything is now blank. Wait for the correct password */
+#ifdef HAVE_BSD_AUTH
+	readpw(dpy, &rr, locks, nscreens);
+#else
 	readpw(dpy, &rr, locks, nscreens, hash);
+#endif
 
 	return 0;
 }
